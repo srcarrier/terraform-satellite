@@ -1,13 +1,3 @@
-variable "sshkey_pub" {}
-variable "resource_group" { default = "default" }
-variable "location_name" { default = "satellite-location" }
-variable "vpc_name" { default = "vpc-satellite" }
-variable "sshkey_name" { default = "sshkey-satellite" }
-variable "instance_template_name" { default = "vsi-template-satellite" }
-variable "vsi_profile" { default = "bx2d-4x16" }
-variable "instance_group_name" { default = "instance-group-satellite"}
-variable "instance_count" { default = 6 }
-variable "cluster_name" { default = "roks-satellite"}
 
 // Location Zones
 locals {
@@ -19,6 +9,12 @@ data "ibm_resource_group" "group" {
     name = var.resource_group
 }
 
+resource "random_string" "str" {
+  length  = 5
+  special = false
+  upper   = false
+}
+
 // VPC
 resource "ibm_is_vpc" "vpc" {
   name            = var.vpc_name
@@ -27,10 +23,11 @@ resource "ibm_is_vpc" "vpc" {
 
 // Satellite location
 resource "ibm_satellite_location" "satellite-location" {
-  location          = var.location_name
+  location          = "${var.location_name}-${random_string.str.result}"
   zones             = local.location_zones
-  managed_from      = "wdc" // TODO use map to figure this out based on region
+  managed_from      = var.region_locations[var.region]
   resource_group_id = data.ibm_resource_group.group.id
+  coreos_enabled    = true // Always create coreos-enabled location
 }
 
 // Public gateway for each zone
@@ -54,17 +51,17 @@ resource "ibm_is_subnet" "subnets" {
 }
 
 // SSH key
-resource "ibm_is_ssh_key" "pub" {
+data "ibm_is_ssh_key" "pub" {
   name       = var.sshkey_name
-  public_key = var.sshkey_pub
-  resource_group = data.ibm_resource_group.group.id
 }
 
 // Instance template
 resource "ibm_is_instance_template" "instance_template" {
   name                      = var.instance_template_name
-  image                     = "r006-c51d1db2-834a-45da-a807-4b59243857ec"
-  metadata_service_enabled  = true
+  image                     = var.host_image_id
+  metadata_service {
+    enabled = true
+  }
   profile                   = var.vsi_profile
 
   primary_network_interface {
@@ -75,7 +72,7 @@ resource "ibm_is_instance_template" "instance_template" {
   vpc  = ibm_is_vpc.vpc.id
   user_data = data.ibm_satellite_attach_host_script.attach_host.host_script
   zone = local.location_zones[0]
-  keys = [ibm_is_ssh_key.pub.id]
+  keys = [data.ibm_is_ssh_key.pub.id]
   resource_group = data.ibm_resource_group.group.id
 
   boot_volume {
@@ -93,7 +90,7 @@ resource "ibm_is_instance_template" "instance_template" {
   }
   depends_on = [
     ibm_satellite_location.satellite-location,
-    ibm_is_ssh_key.pub
+    data.ibm_is_ssh_key.pub
   ]
 }
 
@@ -116,16 +113,9 @@ resource "ibm_is_instance_group" "instance_group" {
 // Custom host attach script
 data "ibm_satellite_attach_host_script" "attach_host" {
   location      = ibm_satellite_location.satellite-location.id
-  //host_provider = "ibm"
-  // TODO add secondary user
-  custom_script = <<EOF
-subscription-manager refresh
-subscription-manager repos --enable rhel-server-rhscl-7-rpms
-subscription-manager repos --enable rhel-7-server-optional-rpms
-subscription-manager repos --enable rhel-7-server-rh-common-rpms
-subscription-manager repos --enable rhel-7-server-supplementary-rpms
-subscription-manager repos --enable rhel-7-server-extras-rpms
-EOF
+  custom_script = var.custom_scripts[var.host_os].script
+  coreos_host = var.host_os == "RHCOS" ? true : null
+  host_provider = var.host_os == "RHCOS" ? "ibm" : null
   depends_on = [
     ibm_satellite_location.satellite-location
   ]
@@ -143,6 +133,7 @@ data "ibm_is_instances" "vms" {
   instance_group = ibm_is_instance_group.instance_group.id
 }
 
+// Assign control plane hosts
 resource "ibm_satellite_host" "assign_hosts" {
   for_each    = toset(local.location_zones)
   location    = ibm_satellite_location.satellite-location.id
@@ -153,38 +144,23 @@ resource "ibm_satellite_host" "assign_hosts" {
   ]
 }
 
-resource "ibm_satellite_cluster" "create_cluster" {
+resource "ibm_satellite_cluster" "create" {
     name                   = var.cluster_name
     location               = data.ibm_satellite_location.location_info.id
     enable_config_admin    = true
-    kube_version           = "4.10_openshift" // TODO make configurable
+    kube_version           = var.kube_version
+    operating_system       = var.host_os
+    host_labels            = (["os:${var.host_os}"])
     resource_group_id      = data.ibm_resource_group.group.id
     wait_for_worker_update = true
-    //zones                  = local.location_zones
     dynamic "zones" {
         for_each = data.ibm_satellite_location.location_info.zones
         content {
             id  = zones.value
         }
     }
+    worker_count           = 1 
     depends_on  = [
       ibm_is_instance_group.instance_group
-    ]
-}
-
-resource "ibm_satellite_cluster_worker_pool" "create_worker_pool" {
-    name               = "roks-wp-satellite"
-    cluster            = ibm_satellite_cluster.create_cluster.id
-    worker_count       = 1
-    resource_group_id  = data.ibm_resource_group.group.id
-    dynamic "zones" {
-        for_each = data.ibm_satellite_location.location_info.zones
-        content {
-              id  = zones.value
-        }
-      }
-    host_labels        = ["os:RHEL7"]
-    depends_on = [
-      ibm_satellite_cluster.create_cluster
     ]
 }
